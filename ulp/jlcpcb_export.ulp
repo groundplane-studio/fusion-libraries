@@ -1,0 +1,610 @@
+#usage "JLCPCB Complete Export - Generates BOM and Placement files for JLCPCB assembly"
+
+// JLCPCB BOM and pick-and-place (CPL) export for Fusion Electronics.
+// Copyright (c) 2026 Ground Plane Studio, LLC. CC BY 4.0, see LICENSE and DISCLAIMER.md.
+// Provided as is, with no warranty: check JLCPCB's placement preview before ordering.
+// https://github.com/groundplane-studio/fusion-libraries
+
+string Version = "1.0";  // JLCPCB Complete Export
+string fileMessage;
+
+// Calculate rotation angle (keeps exact angle value)
+string rotation(real Angle)
+{
+  // Normalize angle to 0-360 range
+  while (Angle < 0) Angle += 360;
+  while (Angle >= 360) Angle -= 360;
+  
+  string s;
+  sprintf(s, "%.2f", Angle);
+  // Remove trailing zeros and decimal point if not needed
+  int pos = strchr(s, '.');
+  if (pos >= 0) {
+    // Check if decimal part is all zeros
+    int allZeros = 1;
+    int i = pos + 1;
+    while (i < strlen(s)) {
+      if (s[i] != '0') {
+        allZeros = 0;
+        break;
+      }
+      i++;
+    }
+    if (allZeros) {
+      s[pos] = 0; // Remove decimal point and zeros
+    } else {
+      // Remove trailing zeros
+      i = strlen(s) - 1;
+      while (i > pos && s[i] == '0') {
+        s[i] = 0;
+        i--;
+      }
+      if (i == pos) s[pos] = 0; // Remove decimal if nothing after
+    }
+  }
+  return s;
+}
+
+// Convert integer to string
+string intToString(int n)
+{
+  string s;
+  sprintf(s, "%d", n);
+  return s;
+}
+
+// Parse string to real for JLC-* offset attributes. Returns 0 if empty or invalid.
+real parseAttrReal(string s)
+{
+  if (strlen(s) == 0) return 0;
+  return strtod(s);
+}
+
+// Write UTF-8 BOM so Excel / editors treat the CSV as UTF-8 (needed for ohm symbol).
+int writeUtf8Bom()
+{
+  printf("%c%c%c", 239, 187, 191); // 0xEF 0xBB 0xBF
+  return 0;
+}
+
+// Print a value, rewriting ohm symbols as UTF-8 Omega (CE A9).
+// Fusion stores Omega in strings as unicode codepoint 937 (U+03A9). Printing
+// that with %s/%c transliterates it to ASCII "O". Detect codepoint 937 (and
+// related forms) and emit UTF-8 Omega bytes via printf %c instead.
+// NOTE: do not name the parameter "value" -- indexing E.value is illegal in ULP.
+int printResOhmValue(string val)
+{
+  int i;
+  int len;
+  int c;
+  int prev;
+  int prev2;
+  int isOhm;
+  int skip;
+
+  i = 0;
+  len = strlen(val);
+
+  while (i < len) {
+    c = val[i];
+    isOhm = 0;
+    skip = 1;
+
+    // UTF-8 Greek Omega CE A9
+    if (i + 1 < len && c == 206 && val[i + 1] == 169) {
+      isOhm = 1;
+      skip = 2;
+    }
+    // UTF-8 Ohm Sign E2 84 A6
+    else if (i + 2 < len && c == 226 && val[i + 1] == 132 && val[i + 2] == 166) {
+      isOhm = 1;
+      skip = 3;
+    }
+    // Unicode codepoint Omega (U+03A9 = 937) or Ohm Sign (U+2126 = 8486)
+    // or already-transliterated ASCII O (79)
+    else if (c == 937 || c == 8486 || c == 79) {
+      isOhm = 1;
+      skip = 1;
+    }
+
+    // Only rewrite when it looks like a resistance value
+    // (digit before, or k/K/M/m after a digit)
+    if (isOhm) {
+      if (i <= 0) {
+        isOhm = 0;
+      } else {
+        prev = val[i - 1];
+        if (prev == 107 || prev == 75 || prev == 77 || prev == 109) {
+          // k K M m -- require a digit before the multiplier
+          if (i >= 2) {
+            prev2 = val[i - 2];
+            if (prev2 < 48 || prev2 > 57) {
+              isOhm = 0;
+            }
+          } else {
+            isOhm = 0;
+          }
+        } else if (prev < 48 || prev > 57) {
+          // not a digit
+          isOhm = 0;
+        }
+      }
+    }
+
+    if (isOhm) {
+      printf("%c%c", 206, 169); // UTF-8 Omega
+      i = i + skip;
+    } else {
+      printf("%c", c);
+      i = i + 1;
+    }
+  }
+
+  return 0;
+}
+
+// Apply JLC X/Y offsets in component space: transform to board space by final angle.
+// 0 deg => X,Y as-is; 90 deg => X->-Y, Y->X; 180 deg => -X,-Y; 270 deg => X->Y, Y->-X
+real getEffectiveOffsetX(real x_off, real y_off, real angle_deg)
+{
+  while (angle_deg < 0) angle_deg += 360;
+  while (angle_deg >= 360) angle_deg -= 360;
+  int q = (angle_deg + 45) / 90;
+  while (q >= 4) q -= 4;
+  while (q < 0) q += 4;
+  if (q == 0) return x_off;
+  if (q == 1) return -y_off;
+  if (q == 2) return -x_off;
+  return y_off;
+}
+real getEffectiveOffsetY(real x_off, real y_off, real angle_deg)
+{
+  while (angle_deg < 0) angle_deg += 360;
+  while (angle_deg >= 360) angle_deg -= 360;
+  int q = (angle_deg + 45) / 90;
+  while (q >= 4) q -= 4;
+  while (q < 0) q += 4;
+  if (q == 0) return y_off;
+  if (q == 1) return x_off;
+  if (q == 2) return -y_off;
+  return -x_off;
+}
+
+// Note: the JLC_FOOTPRINT marker check is done inline at each usage site below
+// (rather than as a function taking UL_ELEMENT), since passing built-in object
+// types as function parameters isn't reliably supported across EAGLE versions.
+
+// ============================================================================
+// EXCLUSION PATTERNS - Update these patterns in ALL places marked below
+// ============================================================================
+// Exclusion patterns checked:
+// 1. _NC in component name
+// 2. NC/ in component value
+// 3. MOUNTHOLES or MOUNTHOLE in name, value, or footprint
+// 4. TEST_POINT or TESTPOINT in footprint
+// 5. TP in component name
+// 
+// To add new patterns, add checks in ALL marked sections below:
+// - BOM export (included)
+// - BOM export (excluded) 
+// - PNP export (included)
+// - PNP export (excluded)
+// ============================================================================
+
+// Get the filename from user
+string usrFilename;
+board(B){
+    // Remove .brd extension from board name if present
+    string boardName = B.name;
+    int extPos = strstr(boardName, ".brd");
+    if (extPos >= 0) {
+      boardName[extPos] = 0; // Remove .brd extension
+    }
+    usrFilename = dlgFileSave("Pick a location and prefix name for JLCPCB export", boardName, "");
+}
+
+// Display error dialog if NOT in board view
+if (!board) {
+   dlgMessageBox("<hr><b>ERROR: This ULP will only operate in the board layout view.</b></hr><p>Switch to the board layout editor and re-run.");
+   exit(1);
+}
+
+// Combined export: BOM and Placement files
+if (board) board(B) {
+   // Resolve the layer number for "JLC_FOOTPRINT" once. Text objects only expose
+   // .layer as an int (the layer number), not an object with a .name, so we need
+   // this to compare against later. Stays -1 if the board has no such layer.
+   int jlcFootprintLayerNum = -1;
+   B.layers(L) {
+     if (L.name == "JLC_FOOTPRINT") jlcFootprintLayerNum = L.number;
+   }
+
+   // Counters for BOM
+   int bomTotalComponents = 0;
+   int bomUniqueParts = 0;
+   int bomExcludedCount = 0;
+   
+   // Counters for Placement
+   int pnpTopCount = 0;
+   int pnpBottomCount = 0;
+   int pnpExcludedCount = 0;
+   int pnpOffsetCount = 0;  // components with JLC-X-OFFSET / JLC-Y-OFFSET / JLC-ROTATION
+   int pnpOffsetIgnoredCount = 0;  // components where offsets were ignored due to JLC_FOOTPRINT text marker
+   
+   // Helper function to check if component is excluded (inline check)
+   // Exclusion patterns:
+   // - _NC in component name
+   // - NC/ in component value
+   // - MOUNTHOLES or MOUNTHOLE in component name
+   // - TEST_POINT in footprint name
+   // - TP in component name (test points)
+   // Add more patterns as needed
+   
+   // ===== EXPORT BOM (included components) =====
+   output(usrFilename + "_BOM.csv") {
+     writeUtf8Bom();
+     printf("QTY,Comment,Designator,Footprint,JLCPCB Part #（optional）,MF,MP\n");
+     
+     B.elements(E1) {
+       // Check if component should be excluded (UPDATE ALL PATTERNS HERE)
+       int isExcluded = 0;
+       if (strstr(E1.name, "_NC") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E1.value, "NC/") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E1.name, "MOUNTHOLES") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E1.name, "MOUNTHOLE") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E1.value, "MOUNTHOLES") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E1.value, "MOUNTHOLE") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E1.package.name, "MOUNTHOLES") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E1.package.name, "MOUNTHOLE") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E1.package.name, "TEST_POINT") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E1.package.name, "TESTPOINT") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E1.name, "TP") >= 0) isExcluded = 1;
+       
+       // Skip excluded components
+       if (isExcluded) {
+         bomExcludedCount++;
+         continue;
+       }
+       
+       // Check if we've already processed this value+footprint combination
+       int alreadyProcessed = 0;
+       B.elements(E2) {
+         if (E2.name == E1.name) break;
+         
+         // Check if E2 is excluded (UPDATE ALL PATTERNS HERE)
+         int isE2Excluded = 0;
+         if (strstr(E2.name, "_NC") >= 0) isE2Excluded = 1;
+         if (!isE2Excluded && strstr(E2.value, "NC/") >= 0) isE2Excluded = 1;
+         if (!isE2Excluded && strstr(E2.name, "MOUNTHOLES") >= 0) isE2Excluded = 1;
+         if (!isE2Excluded && strstr(E2.name, "MOUNTHOLE") >= 0) isE2Excluded = 1;
+         if (!isE2Excluded && strstr(E2.value, "MOUNTHOLES") >= 0) isE2Excluded = 1;
+         if (!isE2Excluded && strstr(E2.value, "MOUNTHOLE") >= 0) isE2Excluded = 1;
+         if (!isE2Excluded && strstr(E2.package.name, "MOUNTHOLES") >= 0) isE2Excluded = 1;
+         if (!isE2Excluded && strstr(E2.package.name, "MOUNTHOLE") >= 0) isE2Excluded = 1;
+         if (!isE2Excluded && strstr(E2.package.name, "TEST_POINT") >= 0) isE2Excluded = 1;
+         if (!isE2Excluded && strstr(E2.package.name, "TESTPOINT") >= 0) isE2Excluded = 1;
+         if (!isE2Excluded && strstr(E2.name, "TP") >= 0) isE2Excluded = 1;
+         
+         if (!isE2Excluded && E2.value == E1.value && E2.package.name == E1.package.name) {
+           alreadyProcessed = 1;
+           break;
+         }
+       }
+       
+       // If not already processed, collect all matching components
+       if (!alreadyProcessed) {
+         int qty = 0;
+         string designators = "";
+         string jlcpcbPart = "";
+         string mf = "";
+         string mp = "";
+         
+         // Collect all components with same value and footprint
+         B.elements(E3) {
+           // Check if E3 is excluded (UPDATE ALL PATTERNS HERE)
+           int isE3Excluded = 0;
+           if (strstr(E3.name, "_NC") >= 0) isE3Excluded = 1;
+           if (!isE3Excluded && strstr(E3.value, "NC/") >= 0) isE3Excluded = 1;
+           if (!isE3Excluded && strstr(E3.name, "MOUNTHOLES") >= 0) isE3Excluded = 1;
+           if (!isE3Excluded && strstr(E3.name, "MOUNTHOLE") >= 0) isE3Excluded = 1;
+           if (!isE3Excluded && strstr(E3.value, "MOUNTHOLES") >= 0) isE3Excluded = 1;
+           if (!isE3Excluded && strstr(E3.value, "MOUNTHOLE") >= 0) isE3Excluded = 1;
+           if (!isE3Excluded && strstr(E3.package.name, "MOUNTHOLES") >= 0) isE3Excluded = 1;
+           if (!isE3Excluded && strstr(E3.package.name, "MOUNTHOLE") >= 0) isE3Excluded = 1;
+           if (!isE3Excluded && strstr(E3.package.name, "TEST_POINT") >= 0) isE3Excluded = 1;
+           if (!isE3Excluded && strstr(E3.package.name, "TESTPOINT") >= 0) isE3Excluded = 1;
+           if (!isE3Excluded && strstr(E3.name, "TP") >= 0) isE3Excluded = 1;
+           
+           if (!isE3Excluded && E3.value == E1.value && E3.package.name == E1.package.name) {
+             qty++;
+             bomTotalComponents++;
+             
+             // Build designator list
+             if (strlen(designators) > 0) {
+               designators += ", ";
+             }
+             designators += E3.name;
+             
+             // Get JLCPCB part number, MF and MP from attributes
+             if (strlen(jlcpcbPart) == 0) {
+               jlcpcbPart = E3.attribute["JLCPCB"];
+             }
+             if (strlen(mf) == 0) {
+               mf = E3.attribute["MF"];
+             }
+             if (strlen(mp) == 0) {
+               mp = E3.attribute["MP"];
+             }
+           }
+         }
+         
+         // Format designators - if multiple, wrap in quotes
+         string designatorField = designators;
+         if (qty > 1) {
+           designatorField = "\"" + designators + "\"";
+         }
+         
+         // Output the BOM line (copy value first -- E.value[i] is illegal in ULP)
+         string bomVal;
+         bomVal = E1.value;
+         printf("%d,", qty);
+         printResOhmValue(bomVal);
+         printf(",%s,%s,%s,%s,%s\n", designatorField, E1.package.name, jlcpcbPart, mf, mp);
+         bomUniqueParts++;
+       }
+     }
+   }
+   
+   // ===== EXPORT BOM_EXCLUDED =====
+   output(usrFilename + "_BOM_excluded.csv") {
+     writeUtf8Bom();
+     printf("Designator,Value,Footprint,JLCPCB Part #,MF,MP,Reason\n");
+     
+     B.elements(E) {
+       // Check if component should be excluded (UPDATE ALL PATTERNS HERE)
+       int isExcluded = 0;
+       string excludeReason = "";
+       if (strstr(E.name, "_NC") >= 0) {
+         isExcluded = 1;
+         excludeReason = "_NC in name";
+       }
+       if (!isExcluded && strstr(E.value, "NC/") >= 0) {
+         isExcluded = 1;
+         excludeReason = "NC/ in value";
+       }
+       if (!isExcluded && strstr(E.name, "MOUNTHOLES") >= 0) {
+         isExcluded = 1;
+         excludeReason = "MOUNTHOLES in name";
+       }
+       if (!isExcluded && strstr(E.name, "MOUNTHOLE") >= 0) {
+         isExcluded = 1;
+         excludeReason = "MOUNTHOLE in name";
+       }
+       if (!isExcluded && strstr(E.value, "MOUNTHOLES") >= 0) {
+         isExcluded = 1;
+         excludeReason = "MOUNTHOLES in value";
+       }
+       if (!isExcluded && strstr(E.value, "MOUNTHOLE") >= 0) {
+         isExcluded = 1;
+         excludeReason = "MOUNTHOLE in value";
+       }
+       if (!isExcluded && strstr(E.package.name, "MOUNTHOLES") >= 0) {
+         isExcluded = 1;
+         excludeReason = "MOUNTHOLES in footprint";
+       }
+       if (!isExcluded && strstr(E.package.name, "MOUNTHOLE") >= 0) {
+         isExcluded = 1;
+         excludeReason = "MOUNTHOLE in footprint";
+       }
+       if (!isExcluded && strstr(E.package.name, "TEST_POINT") >= 0) {
+         isExcluded = 1;
+         excludeReason = "TEST_POINT in footprint";
+       }
+       if (!isExcluded && strstr(E.package.name, "TESTPOINT") >= 0) {
+         isExcluded = 1;
+         excludeReason = "TESTPOINT in footprint";
+       }
+       if (!isExcluded && strstr(E.name, "TP") >= 0) {
+         isExcluded = 1;
+         excludeReason = "TP in name";
+       }
+       
+       // Export excluded components
+       if (isExcluded) {
+         string jlcpcbPart = E.attribute["JLCPCB"];
+         string mf = E.attribute["MF"];
+         string mp = E.attribute["MP"];
+         string exclVal;
+         exclVal = E.value;
+         printf("%s,", E.name);
+         printResOhmValue(exclVal);
+         printf(",%s,%s,%s,%s,%s\n", E.package.name, jlcpcbPart, mf, mp, excludeReason);
+       }
+     }
+   }
+   
+   // ===== EXPORT PNP (placement file, included components) =====
+   output(usrFilename + "_PNP.csv") {
+     printf("Designator,Mid X,Mid Y,Layer,Rotation\n");
+     
+     B.elements(E) {
+       // Check if component should be excluded (UPDATE ALL PATTERNS HERE)
+       int isExcluded = 0;
+       if (strstr(E.name, "_NC") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E.value, "NC/") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E.name, "MOUNTHOLES") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E.name, "MOUNTHOLE") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E.value, "MOUNTHOLES") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E.value, "MOUNTHOLE") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E.package.name, "MOUNTHOLES") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E.package.name, "MOUNTHOLE") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E.package.name, "TEST_POINT") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E.package.name, "TESTPOINT") >= 0) isExcluded = 1;
+       if (!isExcluded && strstr(E.name, "TP") >= 0) isExcluded = 1;
+       
+       // Export included components
+       if (!isExcluded) {
+         // If the package has a "JLC" text marker on the JLC_FOOTPRINT layer,
+         // ignore any JLC-X-OFFSET / JLC-Y-OFFSET / JLC-ROTATION attributes for this component.
+         int ignoreJlcOffset = 0;
+         E.package.texts(T) {
+           if (T.layer == jlcFootprintLayerNum && jlcFootprintLayerNum >= 0 && strstr(T.value, "JLC") >= 0) {
+             ignoreJlcOffset = 1;
+           }
+         }
+         int hasOffsetAttrs = (strlen(E.attribute["JLC-X-OFFSET"]) > 0 || strlen(E.attribute["JLC-Y-OFFSET"]) > 0 || strlen(E.attribute["JLC-ROTATION"]) > 0);
+
+         // Count if any JLC offset/rotation attribute is present (for troubleshooting)
+         if (hasOffsetAttrs && !ignoreJlcOffset) {
+           pnpOffsetCount++;
+         }
+         if (hasOffsetAttrs && ignoreJlcOffset) {
+           pnpOffsetIgnoredCount++;
+         }
+
+         // Convert coordinates and apply JLC offsets (transformed by final angle),
+         // unless this component's footprint carries the JLC_FOOTPRINT text marker.
+         real x_off, y_off, angle_deg;
+         if (ignoreJlcOffset) {
+           x_off = 0;
+           y_off = 0;
+           angle_deg = E.angle;
+         } else {
+           x_off = parseAttrReal(E.attribute["JLC-X-OFFSET"]);
+           y_off = parseAttrReal(E.attribute["JLC-Y-OFFSET"]);
+           angle_deg = E.angle + parseAttrReal(E.attribute["JLC-ROTATION"]);
+         }
+         real eff_x = getEffectiveOffsetX(x_off, y_off, angle_deg);
+         real eff_y = getEffectiveOffsetY(x_off, y_off, angle_deg);
+         if (E.mirror) eff_x = -eff_x;  // bottom layer: invert X offset
+         real x_mm = u2mm(E.x) + eff_x;
+         real y_mm = u2mm(E.y) + eff_y;
+         
+         // Check if component is on TOP layer (not mirrored)
+         if (!E.mirror) {
+           printf("%s,%.2f,%.2f,Top,%s\n", E.name, x_mm, y_mm, rotation(angle_deg));
+           pnpTopCount++;
+         }
+         // Check if component is on BOTTOM layer (mirrored)
+         else {
+           printf("%s,%.2f,%.2f,Bottom,%s\n", E.name, x_mm, y_mm, rotation(angle_deg));
+           pnpBottomCount++;
+         }
+       }
+     }
+   }
+   
+   // ===== EXPORT PNP_EXCLUDED =====
+   output(usrFilename + "_PNP_excluded.csv") {
+     writeUtf8Bom();
+     printf("Designator,Value,Layer,Reason,X (mm),Y (mm),Rotation\n");
+     
+     B.elements(E) {
+       // Check if component should be excluded (UPDATE ALL PATTERNS HERE)
+       int isExcluded = 0;
+       string excludeReason = "";
+       if (strstr(E.name, "_NC") >= 0) {
+         isExcluded = 1;
+         excludeReason = "_NC in name";
+       }
+       if (!isExcluded && strstr(E.value, "NC/") >= 0) {
+         isExcluded = 1;
+         excludeReason = "NC/ in value";
+       }
+       if (!isExcluded && strstr(E.name, "MOUNTHOLES") >= 0) {
+         isExcluded = 1;
+         excludeReason = "MOUNTHOLES in name";
+       }
+       if (!isExcluded && strstr(E.name, "MOUNTHOLE") >= 0) {
+         isExcluded = 1;
+         excludeReason = "MOUNTHOLE in name";
+       }
+       if (!isExcluded && strstr(E.value, "MOUNTHOLES") >= 0) {
+         isExcluded = 1;
+         excludeReason = "MOUNTHOLES in value";
+       }
+       if (!isExcluded && strstr(E.value, "MOUNTHOLE") >= 0) {
+         isExcluded = 1;
+         excludeReason = "MOUNTHOLE in value";
+       }
+       if (!isExcluded && strstr(E.package.name, "MOUNTHOLES") >= 0) {
+         isExcluded = 1;
+         excludeReason = "MOUNTHOLES in footprint";
+       }
+       if (!isExcluded && strstr(E.package.name, "MOUNTHOLE") >= 0) {
+         isExcluded = 1;
+         excludeReason = "MOUNTHOLE in footprint";
+       }
+       if (!isExcluded && strstr(E.package.name, "TEST_POINT") >= 0) {
+         isExcluded = 1;
+         excludeReason = "TEST_POINT in footprint";
+       }
+       if (!isExcluded && strstr(E.package.name, "TESTPOINT") >= 0) {
+         isExcluded = 1;
+         excludeReason = "TESTPOINT in footprint";
+       }
+       if (!isExcluded && strstr(E.name, "TP") >= 0) {
+         isExcluded = 1;
+         excludeReason = "TP in name";
+       }
+       
+       // Export excluded components
+       if (isExcluded) {
+         // If the package has a "JLC" text marker on the JLC_FOOTPRINT layer,
+         // ignore any JLC-X-OFFSET / JLC-Y-OFFSET / JLC-ROTATION attributes for this component.
+         int ignoreJlcOffset = 0;
+         E.package.texts(T) {
+           if (T.layer == jlcFootprintLayerNum && jlcFootprintLayerNum >= 0 && strstr(T.value, "JLC") >= 0) {
+             ignoreJlcOffset = 1;
+           }
+         }
+
+         // Convert coordinates and apply JLC offsets (transformed by final angle),
+         // unless this component's footprint carries the JLC_FOOTPRINT text marker.
+         real x_off, y_off, angle_deg;
+         if (ignoreJlcOffset) {
+           x_off = 0;
+           y_off = 0;
+           angle_deg = E.angle;
+         } else {
+           x_off = parseAttrReal(E.attribute["JLC-X-OFFSET"]);
+           y_off = parseAttrReal(E.attribute["JLC-Y-OFFSET"]);
+           angle_deg = E.angle + parseAttrReal(E.attribute["JLC-ROTATION"]);
+         }
+         real eff_x = getEffectiveOffsetX(x_off, y_off, angle_deg);
+         real eff_y = getEffectiveOffsetY(x_off, y_off, angle_deg);
+         if (E.mirror) eff_x = -eff_x;  // bottom layer: invert X offset
+         real x_mm = u2mm(E.x) + eff_x;
+         real y_mm = u2mm(E.y) + eff_y;
+         
+         // Determine layer
+         string layer = "Top";
+         string pnpExclVal;
+         if (E.mirror) layer = "Bottom";
+         
+         pnpExclVal = E.value;
+         printf("%s,", E.name);
+         printResOhmValue(pnpExclVal);
+         printf(",%s,%s,%.2f,%.2f,%s\n", layer, excludeReason, x_mm, y_mm, rotation(angle_deg));
+         pnpExcludedCount++;
+       }
+     }
+   }
+   
+   
+   // Success message
+   fileMessage = "<hr><b>Success! JLCPCB Export Files Created</b></hr>";
+   fileMessage += "<p><b>BOM File:</b> " + usrFilename + "_BOM.csv";
+   fileMessage += "<p><b>BOM Excluded:</b> " + usrFilename + "_BOM_excluded.csv";
+   fileMessage += "<p><b>PNP File:</b> " + usrFilename + "_PNP.csv";
+   fileMessage += "<p><b>PNP Excluded:</b> " + usrFilename + "_PNP_excluded.csv";
+   fileMessage += "<p><b>BOM:</b> " + intToString(bomUniqueParts) + " unique parts, " + intToString(bomTotalComponents) + " total components";
+   fileMessage += "<p><b>PNP:</b> " + intToString(pnpTopCount) + " top, " + intToString(pnpBottomCount) + " bottom";
+   fileMessage += "<p><b>JLC offsets/rotation applied:</b> " + intToString(pnpOffsetCount) + " components (had JLC-X-OFFSET, JLC-Y-OFFSET, or JLC-ROTATION)";
+   fileMessage += "<p><b>JLC offsets/rotation ignored (JLC_FOOTPRINT marker present):</b> " + intToString(pnpOffsetIgnoredCount) + " components";
+   fileMessage += "<p><b>Excluded:</b> " + intToString(bomExcludedCount) + " (BOM), " + intToString(pnpExcludedCount) + " (PNP)";
+   fileMessage += "<p>Files are ready for upload to JLCPCB assembly service.";
+   
+   dlgMessageBox(fileMessage);
+}
+

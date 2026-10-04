@@ -17,19 +17,17 @@ part number, manufacturer and part number, plus schematic frames and power symbo
 
 | File | Contents | Status |
 |---|---|---|
-| `!GPLIB_PASSIVE.flbr` | Resistors, capacitors (MLCC, electrolytic), inductors, ferrites, fuses, crystals, transformers, filters: a device per package, a variant per value with its JLCPCB part number (79 device sets, 4,059 variants) | Used on all our boards |
-| `!GPLIB_SCHEMATIC.flbr` | Sheet frames (A and B size, title page, contents), about 160 named power rails and 7 ground symbols, and a net tie | Used on all our boards |
-| `!GPLIB_ACTIVE.flbr` | Regulators and PMICs, interface ICs, MCUs, modules, memory, sensors, logic, FETs, diodes, TVS, LEDs (196 device sets) | Less checked: verify before use |
-| `!GPLIB_CONN.flbr` | Connectors and headers (USB, HDMI, RJ45, FFC, SATA, wire-to-board), switches, terminals, antennas, battery holders, relays (109 device sets) | Less checked: verify before use |
-| `!GPLIB_PCB.flbr` | Fiducial, mounting holes, test point, pogo pads, breakaway tab, LED holder | Less checked: verify before use |
+| `GPLIB_PASSIVE.flbr` | Resistors, capacitors (MLCC, electrolytic), inductors, ferrites, fuses, crystals, transformers, filters: a device per package, a variant per value with its JLCPCB part number (79 device sets, 4,059 variants) | Used on all our boards |
+| `GPLIB_SCHEMATIC.flbr` | Sheet frames (A and B size, title page, contents), about 160 named power rails and 7 ground symbols, and a net tie | Used on all our boards |
+| `GPLIB_ACTIVE.flbr` | Regulators and PMICs, interface ICs, MCUs, modules, memory, sensors, logic, FETs, diodes, TVS, LEDs (196 device sets) | Less checked: verify before use |
+| `GPLIB_CONN.flbr` | Connectors and headers (USB, HDMI, RJ45, FFC, SATA, wire-to-board), switches, terminals, antennas, battery holders, relays (109 device sets) | Less checked: verify before use |
+| `GPLIB_PCB.flbr` | Fiducial, mounting holes, test point, pogo pads, breakaway tab, LED holder | Less checked: verify before use |
 
-![!GPLIB_PASSIVE in Fusion's library editor: CAP_0603 with its standard symbol and a variant per value](docs/images/passive-library.png)
+![GPLIB_PASSIVE in Fusion's library editor: CAP_0603 with its standard symbol and a variant per value](docs/images/passive-library.png)
 
 ## Install
 
-1. Download the `.flbr` files you want from `libraries/` (or the latest release:
-   GitHub drops the leading `!` from release downloads, so rename them back to
-   `!GPLIB_....flbr` first).
+1. Download the `.flbr` files you want from `libraries/` or the latest release.
 2. In Fusion, open the **Data Panel**, pick a project, and **Upload** the files.
 3. In a design, open the **Library Manager** and add the libraries from that
    project.
@@ -63,7 +61,7 @@ ULP leaves it out of the BOM and CPL.
 
 ## JLCPCB part numbers
 
-Every variant in `!GPLIB_PASSIVE` carries the JLCPCB part number (the LCSC
+Every variant in `GPLIB_PASSIVE` carries the JLCPCB part number (the LCSC
 C-number, for example `C25804` for a 10k 0603 resistor) in its `JLCPCB`
 attribute, so picking the value in Fusion picks the part JLCPCB will place. Most
 parts in the other libraries carry one too. `JLC_PARTS_TYPE` says whether it was a
@@ -140,13 +138,20 @@ it cannot be sure of), and its block schematics use the frames and power symbols
 It does not replace the placement preview check above. Point it at them with:
 
 ```
-FUSION_MCP_SHEET_FRAME=FRAME_B_L@!GPLIB_SCHEMATIC
-FUSION_MCP_GROUND_SYMBOL=GND_EARTH@!GPLIB_SCHEMATIC
-FUSION_MCP_POWER_SYMBOL=12V@!GPLIB_SCHEMATIC
+FUSION_MCP_SHEET_FRAME=FRAME_B_L@GPLIB_SCHEMATIC
+FUSION_MCP_GROUND_SYMBOL=GND_EARTH@GPLIB_SCHEMATIC
+FUSION_MCP_POWER_SYMBOL=12V@GPLIB_SCHEMATIC
 ```
 
 Parts these libraries do not have can be built from JLCPCB's own footprints
 into a library of your own: see "Your own parts library" in the MCP's README.
+
+## About
+
+Made by [Ground Plane Studio](https://groundplanestudio.com/), a hardware
+development team: industrial design, electronics, firmware and manufacturing,
+from concept to production. Want a board designed, reviewed or brought to
+production? [Get in touch](https://groundplanestudio.com/contact).
 
 ## Licence
 

@@ -2,8 +2,8 @@
 
 ## 2026-10-04
 
-First public release: !GPLIB_PASSIVE, !GPLIB_SCHEMATIC, !GPLIB_ACTIVE,
-!GPLIB_CONN and !GPLIB_PCB.
+First public release: GPLIB_PASSIVE, GPLIB_SCHEMATIC, GPLIB_ACTIVE,
+GPLIB_CONN and GPLIB_PCB.
 
 - Two-pin symbols standardised: 7.62 mm, origin on pin 1, anode or + on the
   left for polar parts.

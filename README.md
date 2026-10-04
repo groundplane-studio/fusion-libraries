@@ -27,7 +27,9 @@ part number, manufacturer and part number, plus schematic frames and power symbo
 
 ## Install
 
-1. Download the `.flbr` files you want from `libraries/` (or the latest release).
+1. Download the `.flbr` files you want from `libraries/` (or the latest release:
+   GitHub drops the leading `!` from release downloads, so rename them back to
+   `!GPLIB_....flbr` first).
 2. In Fusion, open the **Data Panel**, pick a project, and **Upload** the files.
 3. In a design, open the **Library Manager** and add the libraries from that
    project.
